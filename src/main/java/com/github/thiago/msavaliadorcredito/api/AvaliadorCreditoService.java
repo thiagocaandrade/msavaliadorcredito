@@ -1,57 +1,94 @@
 package com.github.thiago.msavaliadorcredito.api;
 
 import com.github.thiago.msavaliadorcredito.domain.model.*;
-import com.github.thiago.msavaliadorcredito.infra.client.CartoesClient;
-import com.github.thiago.msavaliadorcredito.infra.client.ClienteClient;
+import com.github.thiago.msavaliadorcredito.exception.DadosClienteNotFoundException;
+import com.github.thiago.msavaliadorcredito.exception.ErroComunicacaoMicroservicesException;
+import com.github.thiago.msavaliadorcredito.exception.ErroSolicitacaoCartaoException;
+import com.github.thiago.msavaliadorcredito.infra.client.CartoesResourceClient;
+import com.github.thiago.msavaliadorcredito.infra.client.ClienteResourceClient;
+import com.github.thiago.msavaliadorcredito.infra.mqueue.SolicitacaoEmissaoCartaoPublisher;
+import feign.FeignException;
 import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
-import org.springframework.web.bind.annotation.RequestBody;
 
 import java.math.BigDecimal;
 import java.util.List;
+import java.util.UUID;
 import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
 public class AvaliadorCreditoService {
 
-    private final ClienteClient clienteClient;
-    private final CartoesClient cartoesClient;
+    private final ClienteResourceClient clientesClient;
+    private final CartoesResourceClient cartoesClient;
+    private final SolicitacaoEmissaoCartaoPublisher emissaoCartaoPublisher;
 
-    public SituacaoCliente obterSituacaoCliente(String cpf){
+    public SituacaoCliente obterSituacaoCliente(String cpf)
+            throws DadosClienteNotFoundException, ErroComunicacaoMicroservicesException {
+        try {
+            ResponseEntity<DadosCliente> dadosClienteResponse = clientesClient.dadosCliente(cpf);
+            ResponseEntity<List<CartaoCliente>> cartoesResponse = cartoesClient.getCartoesByCliente(cpf);
 
-        ResponseEntity<DadosCliente> dadosClienteResponse = clienteClient.dadosClientes(cpf);
-        ResponseEntity<List<CartaoCliente>> cartoesClienteResponse = cartoesClient.getCartoesByClientes(cpf);
+            return SituacaoCliente
+                    .builder()
+                    .cliente(dadosClienteResponse.getBody())
+                    .cartoes(cartoesResponse.getBody())
+                    .build();
 
-        return SituacaoCliente
-                .builder()
-                .cliente(dadosClienteResponse.getBody())
-                .cartoes(cartoesClienteResponse.getBody())
-                .build();
+        }catch (FeignException.FeignClientException e){
+            int status = e.status();
+            if(HttpStatus.NOT_FOUND.value() == status){
+                throw new DadosClienteNotFoundException();
+            }
+            throw new ErroComunicacaoMicroservicesException(e.getMessage(), status);
+        }
     }
 
-    public RetornoAvaliacaoCliente realizarAvaliacao(String cpf, Long renda){
+    public RetornoAvaliacaoCliente realizarAvaliacao(String cpf, Long renda)
+            throws DadosClienteNotFoundException, ErroComunicacaoMicroservicesException{
+        try{
+            ResponseEntity<DadosCliente> dadosClienteResponse = clientesClient.dadosCliente(cpf);
+            ResponseEntity<List<Cartao>> cartoesResponse = cartoesClient.getCartoesRendaAteh(renda);
 
-        ResponseEntity<DadosCliente> dadosClienteResponse = clienteClient.dadosClientes(cpf);
-        ResponseEntity<List<Cartao>> cartoesResponse = cartoesClient.getCartoesRendaAteh(renda);
-        
-        List<Cartao> cartoes = cartoesResponse.getBody();
-        List<CartaoAprovado> listaCartoesAprovados = cartoes.stream().map(cartao -> {
-            DadosCliente dadosCliente = dadosClienteResponse.getBody();
-            BigDecimal limiteBasico = cartao.getLimiteBasico();
-            BigDecimal idadeBD = BigDecimal.valueOf(dadosCliente.getIdade());
-            BigDecimal fator = idadeBD.divide(BigDecimal.valueOf(10));
-            BigDecimal limiteAprovado = fator.multiply(limiteBasico);
+            List<Cartao> cartoes = cartoesResponse.getBody();
+            var listaCartoesAprovados = cartoes.stream().map(cartao -> {
 
-            CartaoAprovado aprovado = new CartaoAprovado();
-            aprovado.setCartao(cartao.getNome());
-            aprovado.setBandeira(cartao.getBandeira());
-            aprovado.setLimiteAprovado(limiteAprovado);
+                DadosCliente dadosCliente = dadosClienteResponse.getBody();
 
-            return aprovado;
-        }).collect(Collectors.toList());
+                BigDecimal limiteBasico = cartao.getLimiteBasico();
+                BigDecimal idadeBD = BigDecimal.valueOf(dadosCliente.getIdade());
+                var fator = idadeBD.divide(BigDecimal.valueOf(10));
+                BigDecimal limiteAprovado = fator.multiply(limiteBasico);
 
-        return new RetornoAvaliacaoCliente(listaCartoesAprovados);
+                CartaoAprovado aprovado = new CartaoAprovado();
+                aprovado.setCartao(cartao.getNome());
+                aprovado.setBandeira(cartao.getBandeira());
+                aprovado.setLimiteAprovado(limiteAprovado);
+
+                return aprovado;
+            }).collect(Collectors.toList());
+
+            return new RetornoAvaliacaoCliente(listaCartoesAprovados);
+
+        }catch (FeignException.FeignClientException e){
+            int status = e.status();
+            if(HttpStatus.NOT_FOUND.value() == status){
+                throw new DadosClienteNotFoundException();
+            }
+            throw new ErroComunicacaoMicroservicesException(e.getMessage(), status);
+        }
+    }
+
+    public ProtocoloSolicitacaoCartao solicitarEmissaoCartao(DadosSolicitacaoEmissaoCartao dados){
+        try{
+            emissaoCartaoPublisher.solicitarCartao(dados);
+            var protocolo = UUID.randomUUID().toString();
+            return new ProtocoloSolicitacaoCartao(protocolo);
+        }catch (Exception e){
+            throw new ErroSolicitacaoCartaoException(e.getMessage());
+        }
     }
 }
